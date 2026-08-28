@@ -3,7 +3,7 @@
 Usage:
   python -m product_knowledge.ingest --products-db ~/dane/products.db --pk-db /tmp/pk.db --limit 500
 
-Maps ceny_biezace rows to source_listings + price_observations.
+"Ingest observations from scanners / products.db into product-knowledge.\n\nUsage:
 Does NOT auto-merge name-only keys into canonical variants — those stay
 as family-level or provisional listings for review.
 
@@ -40,6 +40,39 @@ def _classify_code(value: str) -> tuple[str, str]:
             return "gtin", digits
     return "mpn", s.upper()
 
+def _split_code_candidates(raw: str) -> list[str]:
+    # "ack651kz / 4949268793414" -> ["ack651kz", "4949268793414"]
+    # "108940-7182 / ck4-09003"  -> ["108940-7182", "ck4-09003"]
+    parts = [x.strip() for x in raw.split("/") if x.strip()]
+    # also split on comma variants occasionally seen
+    expanded: list[str] = []
+    for p in parts:
+        for q in [x.strip() for x in p.split(",") if x.strip()]:
+            if q not in expanded:
+                expanded.append(q)
+    return expanded or [raw.strip()]
+
+def _resolve_compound_code(conn, raw: str) -> tuple[str, str]:
+    # Try each candidate; prefer GTIN hits first
+    cands = _split_code_candidates(raw)
+    gtin_hits: list[tuple[str,str]] = []
+    mpn_hits: list[tuple[str,str]] = []
+    for c in cands:
+        scheme, norm = _classify_code(c)
+        hit = conn.execute("SELECT variant_id FROM product_identifiers WHERE scheme=? AND normalized=?", (scheme, norm)).fetchone()
+        if not hit and scheme == "mpn":
+            hit = conn.execute("SELECT variant_id FROM product_identifiers WHERE normalized=?", (norm,)).fetchone()
+        if hit:
+            if scheme == "gtin":
+                gtin_hits.append((hit[0], c))
+            else:
+                mpn_hits.append((hit[0], c))
+    if gtin_hits:
+        return gtin_hits[0]
+    if mpn_hits:
+        return mpn_hits[0]
+    return "", ""
+
 def ingest(products_db: str, pk_db: str, limit: int = 1000) -> dict:
     src = sqlite3.connect(f"file:{products_db}?mode=ro", uri=True)
     src.row_factory = sqlite3.Row
@@ -49,27 +82,22 @@ def ingest(products_db: str, pk_db: str, limit: int = 1000) -> dict:
         "SELECT klucz, nazwa, sprzedawca, zrodlo, cena, url, ostatnio_widziana FROM ceny_biezace ORDER BY ostatnio_widziana DESC LIMIT ?",
         (limit,),
     ).fetchall()
-    ingested = 0
+    ingested = linked = 0
     for r in rows:
         key, name, seller, source, price, url, seen = r["klucz"], r["nazwa"], r["sprzedawca"], r["zrodlo"], r["cena"], r["url"], r["ostatnio_widziana"]
         if price is None or price <= 0:
             continue
-        # listing id stable per ledger row
         lid = f"{source}:{seller}:{key}"
-        # try to resolve variant via identifier table
         variant_id = ""
         family_id = ""
         if key.startswith("code:"):
-            val = key[5:].strip()
-            scheme, norm = _classify_code(val)
-            hit = dst.execute("SELECT variant_id FROM product_identifiers WHERE scheme=? AND normalized=?", (scheme, norm)).fetchone()
-            if not hit and scheme == "mpn":
-                hit = dst.execute("SELECT variant_id FROM product_identifiers WHERE normalized=?", (norm,)).fetchone()
-            if hit:
-                variant_id = hit[0]
+            raw = key[5:].strip()
+            vid, _ = _resolve_compound_code(dst, raw)
+            if vid:
+                variant_id = vid
                 fam = dst.execute("SELECT family_id FROM product_variants WHERE id=?", (variant_id,)).fetchone()
                 family_id = fam[0] if fam else ""
-        # title fallback
+                linked += 1
         title = name or key
         upsert_listing(dst, lid, source, seller, url or "", title, family_id=family_id, variant_id=variant_id, condition_bucket="new")
         try:
@@ -79,4 +107,4 @@ def ingest(products_db: str, pk_db: str, limit: int = 1000) -> dict:
         add_observation(dst, lid, float(price), observed_at=when)
         ingested += 1
     dst.commit()
-    return {"ingested": ingested, "limit": limit}
+    return {"ingested": ingested, "linked": linked, "limit": limit}
