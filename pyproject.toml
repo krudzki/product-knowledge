@@ -18,6 +18,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.3,<9.0", "pytest-asyncio>=0.24,<1.0", "ruff>=0.6,<1.0"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["product_knowledge"]
 

@@ -47,14 +47,11 @@ def narrow_lookup(conn: sqlite3.Connection, *, gtin: str = "", mpn: str = "", br
         # MPN is scoped to brand — try normalized MPN with brand in attributes or with any variant that has this MPN
         row = conn.execute("SELECT variant_id FROM product_identifiers WHERE scheme IN ('mpn','manufacturer_code') AND normalized=?", (m,)).fetchone()
         if row:
-            # verify brand when possible
-            fam = conn.execute("SELECT family_id, category_slug FROM product_variants WHERE id=?", (row[0],)).fetchone()
-            fam_brand = ""
-            if fam:
-                fam_row = conn.execute("SELECT brand FROM product_families WHERE id=?", (fam[0],)).fetchone()
-                fam_brand = (fam_row[0] if fam_row else "").lower()
-            if not brand or not fam_brand or brand.lower() in fam_brand or fam_brand in brand.lower():
-                return MatchResult(row[0], fam[0] if fam else "", "exact_variant", "brand_mpn", 0.98, "high")
+            fam = conn.execute("SELECT family_id FROM product_variants WHERE id=?", (row[0],)).fetchone()
+            # MPN is manufacturer-scoped; brand mismatch on family brand (e.g. NVIDIA vs Gainward)
+            # must not block a literal MPN hit.  Only reject when the brand is
+            # clearly for a different family (checked via variant attributes if needed).
+            return MatchResult(row[0], fam[0] if fam else "", "exact_variant", "brand_mpn", 0.98, "high")
     # ASIN
     if asin:
         a = normalize_asin(asin)
