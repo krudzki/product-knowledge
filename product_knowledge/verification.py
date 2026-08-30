@@ -42,6 +42,40 @@ ACCESSORY_TYPES = (
 # filter only applies below it.
 ACCESSORY_PRICE_CAP = 150.0
 
+# Refused accessories are appended here rather than dropped. The filter is a
+# budget decision, not a judgement that these items are uninteresting: a steep
+# enough anomaly may still be worth a look, and the log keeps that option open
+# and lets the threshold be re-tuned against real data instead of guesswork.
+DEFAULT_REJECTED_LOG = pathlib.Path.home() / "dane/verification-rejected-accessories.jsonl"
+
+
+def _rejected_log_path() -> pathlib.Path:
+    configured = os.environ.get("VERIFICATION_REJECTED_LOG", "")
+    return pathlib.Path(configured) if configured else DEFAULT_REJECTED_LOG
+
+
+def log_rejected_accessory(candidate: "VerificationCandidate") -> None:
+    """Append one refused candidate as JSON; never raise into the caller."""
+    try:
+        path = _rejected_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(UTC).isoformat(),
+            "store": candidate.store,
+            "title": candidate.title,
+            "url": candidate.url,
+            "current_price": candidate.current_price,
+            "category_slug": candidate.category_slug,
+            "priority": candidate.priority,
+            "gtin": candidate.gtin,
+            "mpn": candidate.mpn,
+            "reason": "low_value_accessory",
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
 
 def is_low_value_accessory(title: str, price: float) -> bool:
     """True when an item is a cheap accessory not worth an AI estimate."""
@@ -157,6 +191,7 @@ class VerificationStore:
         # alert worth the AI budget they consume, so they are refused here
         # rather than filtered per-caller.
         if is_low_value_accessory(candidate.title, candidate.current_price):
+            log_rejected_accessory(candidate)
             return ""
         priority = candidate.priority.upper()
         if priority not in _PRIORITIES:
