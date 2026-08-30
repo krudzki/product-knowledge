@@ -24,6 +24,33 @@ _PRIORITIES = {"P1": 1, "P2": 2, "P3": 3}
 MISPRICE_RATIO = 1.5
 
 
+# Product types whose best-case saving is tens of PLN, so they can never justify
+# an AI estimate no matter how wrong the listed price is. Matched against the
+# START of the title: Polish titles here lead with the product type ("Etui Bizon
+# ...", "Kabel HDMI ..."), whereas a substring match wrongly caught real deals
+# such as "Sluchawki ... z mikrofonem" or a DualSense pad via an incidental
+# "kabel"/"pasek" in the description.
+ACCESSORY_TYPES = (
+    "etui", "folia", "szklo", "szkło", "kabel", "przewod", "przewód",
+    "ladowarka", "ładowarka", "uchwyt", "adapter", "pokrowiec", "podkladka",
+    "podkładka", "torba", "worek", "filtr", "organizer", "sciereczka",
+    "ściereczka", "sciereczki", "ściereczki", "wtyk", "zlaczka", "złączka",
+    "lacznik", "łącznik", "figurka", "naklejka", "smycz", "tabletki",
+    "kapsulki", "kapsułki", "plyn", "płyn", "bity", "wkret", "wkręt",
+)
+# Above this price an accessory can still hide a saving worth looking at, so the
+# filter only applies below it.
+ACCESSORY_PRICE_CAP = 150.0
+
+
+def is_low_value_accessory(title: str, price: float) -> bool:
+    """True when an item is a cheap accessory not worth an AI estimate."""
+    if price <= 0 or price >= ACCESSORY_PRICE_CAP:
+        return False
+    lowered = (title or "").strip().lower()
+    return any(lowered.startswith(f"{word} ") for word in ACCESSORY_TYPES)
+
+
 @dataclass(frozen=True)
 class VerificationCandidate:
     source: str
@@ -125,6 +152,12 @@ class VerificationStore:
         return datetime.now(UTC).isoformat()
 
     def enqueue(self, candidate: VerificationCandidate) -> str:
+        # Single intake gate for every scanner path. Cheap accessories are the
+        # bulk of the queue (measured: 27% of pending) and can never produce an
+        # alert worth the AI budget they consume, so they are refused here
+        # rather than filtered per-caller.
+        if is_low_value_accessory(candidate.title, candidate.current_price):
+            return ""
         priority = candidate.priority.upper()
         if priority not in _PRIORITIES:
             priority = "P3"
