@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS source_listings (
 );
 CREATE INDEX IF NOT EXISTS idx_listings_variant ON source_listings(variant_id, active);
 CREATE INDEX IF NOT EXISTS idx_listings_family ON source_listings(family_id, active);
+-- URL is how scanners and the verification queue address a listing, so the
+-- mispricing ranking joins on it; without this the lookup is a full scan.
+CREATE INDEX IF NOT EXISTS idx_listings_url ON source_listings(url);
 CREATE TABLE IF NOT EXISTS price_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     listing_id TEXT NOT NULL REFERENCES source_listings(id),

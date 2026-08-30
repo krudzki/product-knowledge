@@ -19,6 +19,9 @@ from typing import Iterable
 
 DEFAULT_DB = pathlib.Path.home() / "dane/product-verification.sqlite3"
 _PRIORITIES = {"P1": 1, "P2": 2, "P3": 3}
+# An item now at or below 1/1.5 of a price it was previously observed at is
+# worth an AI estimate before anything else in the queue.
+MISPRICE_RATIO = 1.5
 
 
 @dataclass(frozen=True)
@@ -171,7 +174,36 @@ class VerificationStore:
         return [self.enqueue(candidate) for candidate in candidates]
 
     def pending(self, limit: int = 100) -> list[sqlite3.Row]:
-        return self.conn.execute(
+        """Order the queue so suspected mispricings are estimated first.
+
+        The goal is catching price errors -- a 4000 PLN item listed at 20 PLN --
+        not surveying expensive products, so the previous ``current_price DESC``
+        ordering worked directly against it.
+
+        The ranking signal is an item's own observed price history in the shared
+        knowledge DB: an item now far below a price it was seen at before is a
+        genuine candidate. A category median is deliberately NOT used -- measured
+        on the live queue it surfaced cheap accessories miscategorised into
+        expensive slugs (a 2 PLN antenna plug against a 600 PLN tv-audio median),
+        which are correctly priced and worthless as alerts.
+
+        Items without usable history keep the old priority/price ordering, so the
+        queue degrades gracefully while history accumulates.
+        """
+        ranked: list[sqlite3.Row] = []
+        drops = self._history_drops(limit)
+        if drops:
+            placeholders = ",".join("?" * len(drops))
+            found = self.conn.execute(
+                f"""SELECT * FROM verification_candidates
+                    WHERE status='pending' AND candidate_key IN ({placeholders})""",
+                tuple(drops),
+            ).fetchall()
+            order = {key: index for index, key in enumerate(drops)}
+            ranked = sorted(found, key=lambda row: order[row["candidate_key"]])
+        if len(ranked) >= limit:
+            return ranked[:limit]
+        rest = self.conn.execute(
             """
             SELECT * FROM verification_candidates
             WHERE status='pending'
@@ -181,6 +213,59 @@ class VerificationStore:
             """,
             (limit,),
         ).fetchall()
+        seen = {row["candidate_key"] for row in ranked}
+        for row in rest:
+            if row["candidate_key"] in seen:
+                continue
+            ranked.append(row)
+            if len(ranked) >= limit:
+                break
+        return ranked[:limit]
+
+    def _history_drops(self, limit: int) -> list[str]:
+        """Candidate keys whose own price history shows a steep drop, worst first.
+
+        Best-effort by design: the knowledge DB is a separate file that scanner
+        timers write to constantly, so it may be missing or briefly locked. Any
+        failure falls back to the plain ordering rather than breaking a triage
+        run that would otherwise have produced estimates.
+        """
+        configured = os.environ.get("PRODUCT_KNOWLEDGE_DB", "")
+        knowledge = pathlib.Path(
+            configured or pathlib.Path.home() / "dane/product-knowledge.db"
+        )
+        if not knowledge.exists():
+            return []
+        attached = False
+        try:
+            self.conn.execute(
+                "ATTACH DATABASE ? AS knowledge", (f"file:{knowledge}?mode=ro",)
+            )
+            attached = True
+            rows = self.conn.execute(
+                """
+                SELECT v.candidate_key
+                FROM verification_candidates v
+                JOIN knowledge.source_listings l ON l.url = v.url
+                JOIN knowledge.price_observations o ON o.listing_id = l.id
+                WHERE v.status='pending' AND v.current_price > 0
+                GROUP BY v.candidate_key
+                HAVING COUNT(o.id) >= 2
+                   AND MAX(o.price) >= v.current_price * ?
+                ORDER BY (MAX(o.price) / v.current_price) DESC
+                LIMIT ?
+                """,
+                (MISPRICE_RATIO, limit),
+            ).fetchall()
+            return [row["candidate_key"] for row in rows]
+        except sqlite3.Error:
+            return []
+        finally:
+            if attached:
+                try:
+                    self.conn.execute("DETACH DATABASE knowledge")
+                except sqlite3.Error:
+                    pass
 
     def save_estimate(
         self,
