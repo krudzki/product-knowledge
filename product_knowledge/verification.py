@@ -189,12 +189,23 @@ class VerificationStore:
             self.conn.execute(
                 "ALTER TABLE verification_candidates ADD COLUMN pending_since_at TEXT"
             )
-            self.conn.execute(
-                """UPDATE verification_candidates
-                   SET pending_since_at=CASE
-                       WHEN status='pending' AND estimated_at IS NOT NULL
-                       THEN last_seen_at ELSE first_seen_at END"""
-            )
+        self.conn.execute(
+            """UPDATE verification_candidates
+               SET pending_since_at=CASE
+                   WHEN status='pending' AND estimated_at IS NOT NULL
+                   THEN last_seen_at ELSE first_seen_at END
+               WHERE pending_since_at IS NULL"""
+        )
+        self.conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS trg_verification_pending_since_insert
+               AFTER INSERT ON verification_candidates
+               WHEN NEW.pending_since_at IS NULL
+               BEGIN
+                   UPDATE verification_candidates
+                   SET pending_since_at=NEW.first_seen_at
+                   WHERE candidate_key=NEW.candidate_key;
+               END"""
+        )
         self.conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_verification_pending_fresh
                ON verification_candidates(status, priority, pending_since_at)"""

@@ -165,3 +165,28 @@ def test_only_a_price_change_refreshes_pending_since(store):
     assert changed is not None
     assert changed["status"] == "pending"
     assert changed["pending_since_at"] != old
+
+
+def test_migrated_store_backfills_missing_pending_timestamp(tmp_path):
+    path = tmp_path / "verification.sqlite3"
+    with VerificationStore(path) as migrated:
+        migrated.enqueue(_candidate("migrated", 100.0, priority="P1"))
+        migrated.conn.execute("DROP INDEX idx_verification_pending_fresh")
+        migrated.conn.execute("DROP TRIGGER trg_verification_pending_since_insert")
+        migrated.conn.execute(
+            "ALTER TABLE verification_candidates DROP COLUMN pending_since_at"
+        )
+        migrated.conn.commit()
+
+    with VerificationStore(path) as migrated:
+        row = migrated.export_candidate("migrated")
+        assert row is not None and row["pending_since_at"] is not None
+        migrated.conn.execute(
+            "UPDATE verification_candidates SET pending_since_at=NULL"
+        )
+        migrated.conn.commit()
+
+    with VerificationStore(path) as migrated:
+        row = migrated.export_candidate("migrated")
+
+    assert row is not None and row["pending_since_at"] is not None
