@@ -119,3 +119,49 @@ def test_limit_is_respected_with_ranked_and_plain_rows(store, tmp_path, monkeypa
     keys = [row["candidate_key"] for row in rows]
     assert len(rows) == 3 and len(set(keys)) == 3
     assert keys[0] == "k0"
+
+
+def test_fresh_p1_outranks_old_expensive_p1_without_history(store, monkeypatch):
+    store.enqueue(_candidate("old-expensive", 4000.0, priority="P1"))
+    store.enqueue(_candidate("fresh", 100.0, priority="P1"))
+    store.conn.execute(
+        "UPDATE verification_candidates SET pending_since_at=? WHERE candidate_key=?",
+        ("2026-09-01T06:00:00+00:00", "old-expensive"),
+    )
+    store.conn.execute(
+        "UPDATE verification_candidates SET pending_since_at=? WHERE candidate_key=?",
+        ("2026-09-01T08:00:00+00:00", "fresh"),
+    )
+    store.conn.commit()
+    monkeypatch.setenv("PRODUCT_KNOWLEDGE_DB", "/nonexistent/knowledge.db")
+
+    assert [row["candidate_key"] for row in store.pending(2)] == [
+        "fresh", "old-expensive",
+    ]
+
+
+def test_only_a_price_change_refreshes_pending_since(store):
+    candidate = _candidate("changed", 100.0, priority="P1")
+    store.enqueue(candidate)
+    store.save_estimate(
+        candidate.key, low=200.0, high=250.0, confidence="high",
+        identified=True,
+    )
+    old = "2026-09-01T06:00:00+00:00"
+    store.conn.execute(
+        "UPDATE verification_candidates SET pending_since_at=? WHERE candidate_key=?",
+        (old, candidate.key),
+    )
+    store.conn.commit()
+
+    store.enqueue(candidate)
+    unchanged = store.export_candidate(candidate.key)
+    assert unchanged is not None
+    assert unchanged["status"] == "estimated"
+    assert unchanged["pending_since_at"] == old
+
+    store.enqueue(_candidate("changed", 90.0, priority="P1"))
+    changed = store.export_candidate(candidate.key)
+    assert changed is not None
+    assert changed["status"] == "pending"
+    assert changed["pending_since_at"] != old

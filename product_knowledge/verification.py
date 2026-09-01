@@ -154,6 +154,7 @@ class VerificationStore:
                 status TEXT NOT NULL DEFAULT 'pending',
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
+                pending_since_at TEXT NOT NULL,
                 seen_count INTEGER NOT NULL DEFAULT 1,
                 estimate_low REAL,
                 estimate_high REAL,
@@ -178,6 +179,25 @@ class VerificationStore:
             CREATE INDEX IF NOT EXISTS idx_delivery_candidate
                 ON notification_deliveries(candidate_key, attempted_at DESC);
             """
+        )
+        columns = {
+            row[1] for row in self.conn.execute(
+                "PRAGMA table_info(verification_candidates)"
+            )
+        }
+        if "pending_since_at" not in columns:
+            self.conn.execute(
+                "ALTER TABLE verification_candidates ADD COLUMN pending_since_at TEXT"
+            )
+            self.conn.execute(
+                """UPDATE verification_candidates
+                   SET pending_since_at=CASE
+                       WHEN status='pending' AND estimated_at IS NOT NULL
+                       THEN last_seen_at ELSE first_seen_at END"""
+            )
+        self.conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_verification_pending_fresh
+               ON verification_candidates(status, priority, pending_since_at)"""
         )
         self.conn.commit()
 
@@ -204,11 +224,12 @@ class VerificationStore:
             INSERT INTO verification_candidates (
                 candidate_key, source, store, title, url, current_price,
                 reference_price, category_slug, priority, gtin, mpn, asin,
-                brand, image_url, reason, first_seen_at, last_seen_at
+                brand, image_url, reason, first_seen_at, last_seen_at,
+                pending_since_at
             ) VALUES (
                 :candidate_key, :source, :store, :title, :url, :current_price,
                 :reference_price, :category_slug, :priority, :gtin, :mpn, :asin,
-                :brand, :image_url, :reason, :now, :now
+                :brand, :image_url, :reason, :now, :now, :now
             )
             ON CONFLICT(candidate_key) DO UPDATE SET
                 source=excluded.source,
@@ -226,6 +247,11 @@ class VerificationStore:
                 image_url=excluded.image_url,
                 reason=excluded.reason,
                 last_seen_at=excluded.last_seen_at,
+                pending_since_at=CASE
+                    WHEN verification_candidates.current_price != excluded.current_price
+                    THEN excluded.pending_since_at
+                    ELSE verification_candidates.pending_since_at
+                END,
                 seen_count=verification_candidates.seen_count + 1,
                 status=CASE
                     WHEN verification_candidates.current_price != excluded.current_price
@@ -276,10 +302,12 @@ class VerificationStore:
             SELECT * FROM verification_candidates
             WHERE status='pending'
             ORDER BY CASE priority WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END,
-                     current_price DESC, first_seen_at ASC
+                     CASE WHEN priority='P1' THEN pending_since_at END DESC,
+                     CASE WHEN priority!='P1' THEN first_seen_at END ASC,
+                     current_price DESC
             LIMIT ?
             """,
-            (limit,),
+            (limit + len(ranked),),
         ).fetchall()
         seen = {row["candidate_key"] for row in ranked}
         for row in rest:
