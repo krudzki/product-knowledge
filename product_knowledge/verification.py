@@ -215,7 +215,32 @@ class VerificationStore:
         }
         return "pending_since_at" in columns
 
+    def _backfill_pending_since(self) -> None:
+        """Fill NULL pending timestamps left by older writers.
+
+        Runs only when such rows exist (a read-only probe first), so a
+        steady-state construction takes no write lock while a store that
+        still has unmigrated rows gets the exact same UPDATE as before.
+        """
+        row = self.conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM verification_candidates"
+            " WHERE pending_since_at IS NULL)"
+        ).fetchone()
+        if row is None or not row[0]:
+            return
+        self.conn.execute(
+            """UPDATE verification_candidates
+               SET pending_since_at=CASE
+                   WHEN status='pending' AND estimated_at IS NOT NULL
+                   THEN last_seen_at ELSE first_seen_at END
+               WHERE pending_since_at IS NULL"""
+        )
+        self.conn.commit()
+
     def _init_schema(self) -> None:
+        if self._schema_ready():
+            self._backfill_pending_since()
+            return
         if self._schema_ready():
             return
         self.conn.executescript(
@@ -274,13 +299,7 @@ class VerificationStore:
             self.conn.execute(
                 "ALTER TABLE verification_candidates ADD COLUMN pending_since_at TEXT"
             )
-        self.conn.execute(
-            """UPDATE verification_candidates
-               SET pending_since_at=CASE
-                   WHEN status='pending' AND estimated_at IS NOT NULL
-                   THEN last_seen_at ELSE first_seen_at END
-               WHERE pending_since_at IS NULL"""
-        )
+        self._backfill_pending_since()
         self.conn.execute(
             """CREATE TRIGGER IF NOT EXISTS trg_verification_pending_since_insert
                AFTER INSERT ON verification_candidates
