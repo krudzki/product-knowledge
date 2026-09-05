@@ -122,6 +122,19 @@ class VerificationCandidate:
 _STATEMENT_ATTEMPTS = 5
 _STATEMENT_BASE_DELAY_S = 0.2
 
+#: Objects created by `_init_schema` (tables, indexes, trigger, including past
+#: migrations). When all are present the schema is current and init returns
+#: after two read-only probes instead of taking write locks (DDL + backfill
+#: UPDATE over the whole table) on every construction.
+_SCHEMA_OBJECTS = frozenset({
+    "verification_candidates",
+    "notification_deliveries",
+    "idx_verification_pending",
+    "idx_delivery_candidate",
+    "idx_verification_pending_fresh",
+    "trg_verification_pending_since_insert",
+})
+
 
 def _is_locked(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc)
@@ -174,7 +187,37 @@ class VerificationStore:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
+    def _schema_ready(self) -> bool:
+        """True when the schema (including past migrations) already exists.
+
+        Read-only: two SELECTs, no write lock. Lets every per-cycle
+        `VerificationStore()` skip the DDL + backfill UPDATE that otherwise
+        contend for EXCLUSIVE on the shared disk.
+        """
+        try:
+            names = {
+                row[0]
+                for row in self.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE name IN "
+                    "('verification_candidates','notification_deliveries',"
+                    "'idx_verification_pending','idx_delivery_candidate',"
+                    "'idx_verification_pending_fresh',"
+                    "'trg_verification_pending_since_insert')"
+                )
+            }
+        except sqlite3.OperationalError:
+            return False
+        if len(names) < len(_SCHEMA_OBJECTS):
+            return False
+        columns = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(verification_candidates)")
+        }
+        return "pending_since_at" in columns
+
     def _init_schema(self) -> None:
+        if self._schema_ready():
+            return
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS verification_candidates (
