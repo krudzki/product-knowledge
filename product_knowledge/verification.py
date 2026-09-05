@@ -12,7 +12,9 @@ import hashlib
 import json
 import os
 import pathlib
+import random
 import sqlite3
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Iterable
@@ -111,6 +113,46 @@ class VerificationCandidate:
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
 
+#: Retry for transient `database is locked`: this DB shares the disk with the
+#: fleet's multi-GB SQLite files, and in `delete` journal mode a committing
+#: writer holds EXCLUSIVE, blocking even readers. `busy_timeout` covers short
+#: collisions; a short back-off covers the rest instead of killing the whole
+#: scan cycle (Failed = silent day). Kept local: deal-pipeline depends on
+#: product-knowledge, so importing its retry helper would be circular.
+_STATEMENT_ATTEMPTS = 5
+_STATEMENT_BASE_DELAY_S = 0.2
+
+
+def _is_locked(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc)
+
+
+def _retry_locked(fn, *args, **kwargs):
+    for attempt in range(_STATEMENT_ATTEMPTS):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if not _is_locked(exc) or attempt == _STATEMENT_ATTEMPTS - 1:
+                raise
+            time.sleep(_STATEMENT_BASE_DELAY_S * (2**attempt) + random.uniform(0, 0.05))
+
+
+class _RetryingConnection(sqlite3.Connection):
+    """Connection whose statements survive a transient lock instead of failing."""
+
+    def execute(self, *args, **kwargs):
+        return _retry_locked(super().execute, *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return _retry_locked(super().executemany, *args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        return _retry_locked(super().executescript, *args, **kwargs)
+
+    def commit(self):
+        return _retry_locked(super().commit)
+
+
 class VerificationStore:
     """SQLite-backed candidate queue and notification-delivery audit."""
 
@@ -118,7 +160,7 @@ class VerificationStore:
         configured = os.environ.get("PRODUCT_VERIFICATION_DB", "")
         self.path = pathlib.Path(path or configured or DEFAULT_DB)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, timeout=30)
+        self.conn = sqlite3.connect(self.path, timeout=30, factory=_RetryingConnection)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout=30000")
         self._init_schema()
