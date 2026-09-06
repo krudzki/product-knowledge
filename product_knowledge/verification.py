@@ -114,10 +114,10 @@ class VerificationCandidate:
 
 
 #: Retry for transient `database is locked`: this DB shares the disk with the
-#: fleet's multi-GB SQLite files, and in `delete` journal mode a committing
-#: writer holds EXCLUSIVE, blocking even readers. `busy_timeout` covers short
-#: collisions; a short back-off covers the rest instead of killing the whole
-#: scan cycle (Failed = silent day). Kept local: deal-pipeline depends on
+#: fleet's multi-GB SQLite files. WAL (set in `VerificationStore.__init__`)
+#: stops writers from blocking readers; `busy_timeout` covers short collisions
+#: between writers, and a short back-off covers the rest instead of killing the
+#: whole scan cycle (Failed = silent day). Kept local: deal-pipeline depends on
 #: product-knowledge, so importing its retry helper would be circular.
 _STATEMENT_ATTEMPTS = 5
 _STATEMENT_BASE_DELAY_S = 0.2
@@ -176,6 +176,18 @@ class VerificationStore:
         self.conn = sqlite3.connect(self.path, timeout=30, factory=_RetryingConnection)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout=30000")
+        # journal_mode is a property of the FILE, so the first writer converts
+        # it once and every later connection inherits WAL. The retry above and
+        # busy_timeout both turn a lock into a wait; neither shortens it, and
+        # in `delete` mode a commit takes EXCLUSIVE over the whole file - one
+        # held read transaction stalls every writer. Measured 2026-09-06: after
+        # products.db went WAL, fleet-wide lock errors fell 1227 -> 5 and all
+        # five survivors were this store; a writer here waited 5.04 s on a
+        # reader. synchronous=NORMAL is the durability level WAL is designed
+        # around - a crash can cost the last transactions but cannot corrupt
+        # the file, the right trade for a queue that is continuously refilled.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self._init_schema()
 
     def close(self) -> None:
