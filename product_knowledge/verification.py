@@ -225,7 +225,9 @@ class VerificationStore:
             row[1]
             for row in self.conn.execute("PRAGMA table_info(verification_candidates)")
         }
-        return "pending_since_at" in columns
+        return columns.issuperset(
+            {"pending_since_at", "delivery_claimed_at", "delivery_kind"}
+        )
 
     def _backfill_pending_since(self) -> None:
         """Fill NULL pending timestamps left by older writers.
@@ -284,7 +286,9 @@ class VerificationStore:
                 identified INTEGER NOT NULL DEFAULT 0,
                 pricing_error_likelihood TEXT NOT NULL DEFAULT 'unknown',
                 estimate_rationale TEXT NOT NULL DEFAULT '',
-                estimated_at TEXT
+                estimated_at TEXT,
+                delivery_claimed_at TEXT,
+                delivery_kind TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_verification_pending
                 ON verification_candidates(status, priority, last_seen_at);
@@ -311,6 +315,15 @@ class VerificationStore:
             self.conn.execute(
                 "ALTER TABLE verification_candidates ADD COLUMN pending_since_at TEXT"
             )
+        # The fast lane arrived after production had a populated queue, so the
+        # claim columns are added in place. Nullable by design: NULL is
+        # "nobody has taken this alert yet", which is exactly the state every
+        # pre-existing row should start from.
+        for column in ("delivery_claimed_at", "delivery_kind"):
+            if column not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE verification_candidates ADD COLUMN {column} TEXT"
+                )
         self._backfill_pending_since()
         self.conn.execute(
             """CREATE TRIGGER IF NOT EXISTS trg_verification_pending_since_insert
@@ -384,6 +397,19 @@ class VerificationStore:
                     WHEN verification_candidates.current_price != excluded.current_price
                     THEN 'pending'
                     ELSE verification_candidates.status
+                END,
+                -- A new price is a new deal and deserves a fresh verdict and a
+                -- fresh alert. Re-seeing the SAME offer is not: clearing the
+                -- claim there would re-notify the user on every scan cycle.
+                delivery_claimed_at=CASE
+                    WHEN verification_candidates.current_price != excluded.current_price
+                    THEN NULL
+                    ELSE verification_candidates.delivery_claimed_at
+                END,
+                delivery_kind=CASE
+                    WHEN verification_candidates.current_price != excluded.current_price
+                    THEN NULL
+                    ELSE verification_candidates.delivery_kind
                 END
             """,
             row,
@@ -444,6 +470,75 @@ class VerificationStore:
             if len(ranked) >= limit:
                 break
         return ranked[:limit]
+
+    def pending_pre_notifications(
+        self, *, store: str, limit: int = 20
+    ) -> list[sqlite3.Row]:
+        """Undecided fast-lane candidates for one store, least time left first.
+
+        Deliberately not routed through `pending()`: that ranking exists to
+        find deep mispricings across a backlog measured in thousands, and it
+        attaches the knowledge DB to do it. Here the only question is who is
+        closest to their 90-second deadline, and the answer has to be cheap
+        enough to ask every 15 seconds.
+
+        `pending_since_at` is the parent scanner's own first sighting, so the
+        deadline is measured from when the deal appeared -- not from when this
+        queue happened to import it.
+        """
+        return self.conn.execute(
+            """
+            SELECT * FROM verification_candidates
+            WHERE reason='pre_notification' AND store=? AND status='pending'
+            ORDER BY pending_since_at ASC
+            LIMIT ?
+            """,
+            (store, max(1, int(limit))),
+        ).fetchall()
+
+    def claim_delivery(self, candidate_key: str, kind: str) -> bool:
+        """Take exclusive ownership of one candidate's single alert.
+
+        The AI-verified path and the 90-second timeout path run as separate
+        processes and may both decide to send within milliseconds of each
+        other. The winner is decided by the database, not by a prior read:
+        a check-then-send would let both pass the check before either wrote.
+
+        Returns whether this caller now owns the delivery.
+        """
+        if not candidate_key or not kind:
+            return False
+        cursor = self.conn.execute(
+            """
+            UPDATE verification_candidates
+            SET delivery_claimed_at=?, delivery_kind=?
+            WHERE candidate_key=? AND delivery_claimed_at IS NULL
+            """,
+            (self._now(), kind, candidate_key),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def release_delivery_claim(self, candidate_key: str, kind: str) -> bool:
+        """Hand back a claim whose send failed, so that path may retry.
+
+        Ownership is checked in the same statement: the losing path must not
+        be able to free the winner's alert and cause a double notification.
+        `notification_deliveries` keeps every attempt regardless -- releasing a
+        claim rewinds the right to send, never the audit trail.
+        """
+        if not candidate_key or not kind:
+            return False
+        cursor = self.conn.execute(
+            """
+            UPDATE verification_candidates
+            SET delivery_claimed_at=NULL, delivery_kind=NULL
+            WHERE candidate_key=? AND delivery_kind=?
+            """,
+            (candidate_key, kind),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
 
     def _history_drops(self, limit: int) -> list[str]:
         """Candidate keys whose own price history shows a steep drop, worst first.
