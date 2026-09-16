@@ -19,6 +19,7 @@ once and every later connection inherits WAL.
 from __future__ import annotations
 
 import sqlite3
+import threading
 
 from product_knowledge import outbox
 
@@ -71,3 +72,65 @@ def test_drain_succeeds_while_a_reader_holds_a_transaction(tmp_path):
     finally:
         reader.rollback()
         reader.close()
+
+
+def test_large_drain_releases_the_writer_slot_between_batches(
+    tmp_path, monkeypatch,
+):
+    """A large drain must not hold the only writer slot for its whole run."""
+    pk_db = tmp_path / "knowledge.db"
+    outbox_path = tmp_path / "outbox.jsonl"
+    for number in range(3):
+        outbox.append(
+            outbox_path,
+            source="test",
+            seller="test",
+            url=f"https://example.com/p/{number}",
+            title=f"Probe {number}",
+            price=10.0 + number,
+        )
+
+    from product_knowledge import catalog
+
+    original = catalog.upsert_listing
+    at_batch_boundary = threading.Event()
+    release_drain = threading.Event()
+    calls = 0
+
+    def pause_before_third_write(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            at_batch_boundary.set()
+            assert release_drain.wait(5), "test did not release the drain"
+        return original(*args, **kwargs)
+
+    # `raising=False` is intentional here: the pre-fix implementation had no
+    # batch-size symbol at all, and must proceed far enough to reproduce the
+    # writer lock rather than failing early on the missing constant.
+    monkeypatch.setattr(outbox, "COMMIT_EVERY", 2, raising=False)
+    monkeypatch.setattr(catalog, "upsert_listing", pause_before_third_write)
+
+    errors: list[Exception] = []
+
+    def run_drain():
+        try:
+            outbox.drain(outbox_path, pk_db=pk_db)
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    thread = threading.Thread(target=run_drain)
+    thread.start()
+    assert at_batch_boundary.wait(5), "drain did not reach its batch boundary"
+    try:
+        contender = sqlite3.connect(pk_db, timeout=0.2)
+        contender.execute("PRAGMA busy_timeout=200")
+        contender.execute("BEGIN IMMEDIATE")
+        contender.rollback()
+        contender.close()
+    finally:
+        release_drain.set()
+        thread.join(5)
+
+    assert not errors
+    assert not thread.is_alive()

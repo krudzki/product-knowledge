@@ -17,6 +17,7 @@ import time
 from datetime import datetime
 
 DEFAULT_OUTBOX = pathlib.Path.home() / "dane/product-knowledge-outbox.jsonl"
+COMMIT_EVERY = 250
 
 def append(outbox: pathlib.Path | str = DEFAULT_OUTBOX, *, source: str, seller: str, url: str, title: str,
            price: float, currency: str = "PLN", shipping: float | None = None,
@@ -71,6 +72,11 @@ def drain(outbox: pathlib.Path | str = DEFAULT_OUTBOX, pk_db: str | pathlib.Path
             when = datetime.now()
         add_observation(conn, lid, float(rec.get("price",0)), currency=rec.get("currency","PLN"), shipping=rec.get("shipping"), availability=rec.get("availability","available"), observed_at=when)
         drained += 1
+        # Do not hold SQLite's single WAL writer slot for an entire large
+        # outbox. Production drains regularly contain 7k-13k observations
+        # and previously kept one transaction open for about 30 seconds.
+        if drained % COMMIT_EVERY == 0:
+            conn.commit()
     conn.commit()
     conn.close()
     # truncate outbox after successful drain
