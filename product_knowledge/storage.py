@@ -6,7 +6,37 @@ tables in SQLite so tests and local scanners work without Postgres.
 
 from __future__ import annotations
 
+import pathlib
 import sqlite3
+
+BUSY_TIMEOUT_MS = 30_000
+
+
+def connect_db(
+    path: str | pathlib.Path,
+    *,
+    read_only: bool = False,
+) -> sqlite3.Connection:
+    """Open the knowledge store with the fleet's SQLite concurrency policy.
+
+    The canonical store is read continuously while several collectors drain
+    observations into it. WAL keeps those readers from blocking a writer;
+    the busy timeout covers the remaining short writer/writer collisions.
+    All databases are on local ext4, where WAL is safe.
+    """
+    if read_only:
+        conn = sqlite3.connect(
+            f"file:{pathlib.Path(path)}?mode=ro",
+            uri=True,
+            timeout=BUSY_TIMEOUT_MS / 1_000,
+        )
+    else:
+        conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1_000)
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    if not read_only:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
 
 DDL = """
 CREATE TABLE IF NOT EXISTS product_families (

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import pathlib
-import sqlite3
 import time
 from datetime import datetime
 
@@ -44,11 +43,11 @@ def drain(outbox: pathlib.Path | str = DEFAULT_OUTBOX, pk_db: str | pathlib.Path
         return {"drained": 0, "kept": 0}
     # lazy import to avoid hard dep
     from product_knowledge.catalog import upsert_listing, add_observation
-    from product_knowledge.storage import init_db
+    from product_knowledge.storage import connect_db, init_db
     from product_knowledge.matching import narrow_lookup
 
     pk_db = str(pk_db) or str(pathlib.Path.home() / "dane/product-knowledge.db")
-    conn = sqlite3.connect(pk_db)
+    conn = connect_db(pk_db)
     init_db(conn)
     drained = 0
     kept: list[str] = []
@@ -73,6 +72,7 @@ def drain(outbox: pathlib.Path | str = DEFAULT_OUTBOX, pk_db: str | pathlib.Path
         add_observation(conn, lid, float(rec.get("price",0)), currency=rec.get("currency","PLN"), shipping=rec.get("shipping"), availability=rec.get("availability","available"), observed_at=when)
         drained += 1
     conn.commit()
+    conn.close()
     # truncate outbox after successful drain
     outbox.write_text("", encoding="utf-8")
     return {"drained": drained, "kept": len(kept)}
