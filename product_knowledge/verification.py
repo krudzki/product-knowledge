@@ -585,6 +585,58 @@ class VerificationStore:
                 except sqlite3.Error:
                     pass
 
+    def mark_skipped(self, candidate_key: str, *, reason: str = "accessory") -> bool:
+        """Record that triage refused this candidate, so it stops being re-served.
+
+        ``pending()`` ranks by price drop and hands back the same head of the
+        queue every run. A consumer that then refuses a row - an accessory the
+        AI budget should not be spent on - has nowhere to put that verdict, so
+        the row comes back forever and starves fresh candidates behind it.
+        Measured 2026-09-19: of 600 rows served, 464 had already been refused.
+
+        Deliberately narrow. ``enqueue`` resets a row to 'pending' when the
+        price changes, and that contract is preserved: a marked row returns to
+        the queue the moment it is re-listed at a different price, because a new
+        price is a new deal regardless of what was decided about the old one.
+
+        Returns True when a row was marked, False when the key was unknown or
+        already estimated - so a caller can count real work.
+        """
+        cursor = self.conn.execute(
+            """UPDATE verification_candidates
+               SET status='skipped', estimate_rationale=?, estimated_at=?
+               WHERE candidate_key=? AND status='pending'""",
+            (f"triage refused: {reason}"[:1000], self._now(), candidate_key),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def mark_skipped_many(
+        self, candidate_keys: Iterable[str], *, reason: str = "accessory"
+    ) -> int:
+        """Mark a batch in one transaction. Returns how many rows changed.
+
+        Uses one statement per key rather than ``executemany``: SQLite does not
+        accumulate ``rowcount`` across an executemany, so the batch form cannot
+        tell a caller how much real work it did. The commit still happens once.
+        """
+        keys = [key for key in candidate_keys if key]
+        if not keys:
+            return 0
+        now = self._now()
+        rationale = f"triage refused: {reason}"[:1000]
+        changed = 0
+        for key in keys:
+            cursor = self.conn.execute(
+                """UPDATE verification_candidates
+                   SET status='skipped', estimate_rationale=?, estimated_at=?
+                   WHERE candidate_key=? AND status='pending'""",
+                (rationale, now, key),
+            )
+            changed += max(cursor.rowcount, 0)
+        self.conn.commit()
+        return changed
+
     def save_estimate(
         self,
         candidate_key: str,
