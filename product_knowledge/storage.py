@@ -149,6 +149,48 @@ CREATE TABLE IF NOT EXISTS value_scores (
 );
 """
 
+# Amazon listings are keyed by URL, but every consumer asks by ASIN. The only
+# way to express that without a column was `url LIKE '%/dp/' || asin`, whose
+# leading wildcard cannot use any index: measured 2026-09-24 on the live
+# 944k-row table, 322 ms per lookup (median of 300), issued twice per product
+# by the Amazon scanners - most of the sweep's 90-minute CPU budget.
+#
+# The column is GENERATED from the URL, so it can never drift from it and no
+# writer has to learn about it. It holds the last ten characters when the URL
+# ends in `/dp/<10 chars>` (case-insensitive), which is exactly the set the
+# old LIKE matched: canonical `https://www.amazon.pl/dp/ASIN` rows AND the
+# 71 legacy `.../slug/dp/ASIN` rows written before URL canonicalisation. A
+# host-list lookup on the canonical URL would silently drop the latter and
+# changed the price verdict for 2 of them.
+#
+# VIRTUAL, not STORED: SQLite cannot ADD a stored column to an existing
+# table, and the partial index materialises the value anyway. The ALTER only
+# rewrites the schema; building the index is the one full pass.
+LISTING_ASIN_COLUMN = (
+    "asin TEXT GENERATED ALWAYS AS ("
+    "CASE WHEN lower(substr(url, -14, 4)) = '/dp/' "
+    "THEN upper(substr(url, -10)) END) VIRTUAL"
+)
+
+
+def _ensure_listing_asin(conn: sqlite3.Connection) -> None:
+    """Add the generated ASIN column and its index to an existing store."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_xinfo(source_listings)")}
+    if "asin" not in columns:
+        try:
+            conn.execute(f"ALTER TABLE source_listings ADD COLUMN {LISTING_ASIN_COLUMN}")
+        except sqlite3.OperationalError as error:
+            # Several drains and scanners call init_db; losing the race to
+            # add the column is success, anything else is not.
+            if "duplicate column" not in str(error):
+                raise
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_listings_asin "
+        "ON source_listings(asin, source) WHERE asin IS NOT NULL"
+    )
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
+    _ensure_listing_asin(conn)
     conn.commit()
