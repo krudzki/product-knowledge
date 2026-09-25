@@ -109,6 +109,44 @@ def test_missing_knowledge_db_falls_back_instead_of_failing(store, monkeypatch):
     assert [r["candidate_key"] for r in store.pending(10)] == ["b", "a"]
 
 
+def test_the_drop_ranking_is_reused_between_runs(store, tmp_path, monkeypatch):
+    """Measured 2026-09-25: the history join took 155 s on every triage pass.
+
+    It reads a 20 GB knowledge DB (44 M observations) against the whole
+    pending queue, while a Tier-A pass has 15 minutes in total. Price history
+    moves slowly, so the ranking is kept for a while instead of being rebuilt
+    on every call; rows that stopped being pending still drop out.
+    """
+    store.enqueue(_candidate("drop", 20.0))
+    store.enqueue(_candidate("gone", 30.0))
+    store.enqueue(_candidate("richer", 900.0, priority="P1"))
+    monkeypatch.setenv("PRODUCT_KNOWLEDGE_DB", _knowledge_db(tmp_path / "k.db", [
+        ("https://euro.pl/drop.bhtml", [4000.0, 3900.0]),
+        ("https://euro.pl/gone.bhtml", [9000.0, 8900.0]),
+    ]))
+    assert [r["candidate_key"] for r in store.pending(10)][:2] == ["gone", "drop"]
+
+    store.mark_skipped("gone")
+    monkeypatch.setenv("PRODUCT_KNOWLEDGE_DB", "/nonexistent/knowledge.db")
+    assert [r["candidate_key"] for r in store.pending(10)][:2] == ["drop", "richer"]
+
+
+def test_a_stale_drop_ranking_is_rebuilt(store, tmp_path, monkeypatch):
+    store.enqueue(_candidate("first", 20.0))
+    store.enqueue(_candidate("second", 20.0))
+    knowledge = tmp_path / "k.db"
+    monkeypatch.setenv("PRODUCT_KNOWLEDGE_DB", _knowledge_db(
+        knowledge, [("https://euro.pl/first.bhtml", [400.0, 390.0])]))
+    assert [r["candidate_key"] for r in store.pending(1)] == ["first"]
+
+    knowledge.unlink()
+    _knowledge_db(knowledge, [("https://euro.pl/second.bhtml", [400.0, 390.0])])
+    monkeypatch.setattr(
+        "product_knowledge.verification.time.time", lambda: 10**12,
+    )
+    assert [r["candidate_key"] for r in store.pending(1)] == ["second"]
+
+
 def test_limit_is_respected_with_ranked_and_plain_rows(store, tmp_path, monkeypatch):
     for index in range(5):
         store.enqueue(_candidate(f"k{index}", 100.0 + index))

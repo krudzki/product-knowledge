@@ -24,6 +24,12 @@ _PRIORITIES = {"P1": 1, "P2": 2, "P3": 3}
 # An item now at or below 1/1.5 of a price it was previously observed at is
 # worth an AI estimate before anything else in the queue.
 MISPRICE_RATIO = 1.5
+# The history-drop ranking costs minutes to build (see `_history_drops`) and
+# price history moves slowly, so one build serves every triage pass for an
+# hour. DEPTH is kept well above any caller's limit (the largest asks for 400)
+# so one cached list answers all of them.
+DROP_RANKING_TTL_S = 3600.0
+DROP_RANKING_DEPTH = 2000
 
 
 # Product types whose best-case saving is tens of PLN, so they can never justify
@@ -547,7 +553,19 @@ class VerificationStore:
         timers write to constantly, so it may be missing or briefly locked. Any
         failure falls back to the plain ordering rather than breaking a triage
         run that would otherwise have produced estimates.
+
+        The join reads the whole knowledge DB against the whole pending queue:
+        155 s measured 2026-09-25 (20 GB, 44 M observations, 222 k pending),
+        paid by every triage pass inside a 15-minute unit. Price history moves
+        slowly, so a computed ranking is kept in this DB for
+        ``DROP_RANKING_TTL_S`` and shared by every process; ``pending`` still
+        re-checks each key's status, so settled rows fall out immediately.
         """
+        cached = self._cached_drops()
+        # ponytail: a caller asking beyond DROP_RANKING_DEPTH gets the cached
+        # depth, not its full limit; none does today (largest is 400).
+        if cached is not None:
+            return cached
         configured = os.environ.get("PRODUCT_KNOWLEDGE_DB", "")
         knowledge = pathlib.Path(
             configured or pathlib.Path.home() / "dane/product-knowledge.db"
@@ -573,9 +591,9 @@ class VerificationStore:
                 ORDER BY (MAX(o.price) / v.current_price) DESC
                 LIMIT ?
                 """,
-                (MISPRICE_RATIO, limit),
+                (MISPRICE_RATIO, max(limit, DROP_RANKING_DEPTH)),
             ).fetchall()
-            return [row["candidate_key"] for row in rows]
+            keys = [row["candidate_key"] for row in rows]
         except sqlite3.Error:
             return []
         finally:
@@ -584,6 +602,39 @@ class VerificationStore:
                     self.conn.execute("DETACH DATABASE knowledge")
                 except sqlite3.Error:
                     pass
+        self._store_drops(keys)
+        return keys
+
+    def _cached_drops(self) -> list[str] | None:
+        """The shared drop ranking while it is fresh, else None."""
+        try:
+            row = self.conn.execute(
+                "SELECT computed_at, keys_json FROM ranking_cache WHERE name='drops'"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if row is None or time.time() - float(row["computed_at"]) >= DROP_RANKING_TTL_S:
+            return None
+        return list(json.loads(row["keys_json"]))
+
+    def _store_drops(self, keys: list[str]) -> None:
+        """Share a freshly computed ranking; a failed write only costs a rebuild."""
+        try:
+            self.conn.execute(
+                """CREATE TABLE IF NOT EXISTS ranking_cache (
+                       name TEXT PRIMARY KEY, computed_at REAL NOT NULL,
+                       keys_json TEXT NOT NULL)"""
+            )
+            self.conn.execute(
+                """INSERT INTO ranking_cache (name, computed_at, keys_json)
+                   VALUES ('drops', ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     computed_at=excluded.computed_at, keys_json=excluded.keys_json""",
+                (time.time(), json.dumps(keys)),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            pass
 
     def mark_skipped(self, candidate_key: str, *, reason: str = "accessory") -> bool:
         """Record that triage refused this candidate, so it stops being re-served.
